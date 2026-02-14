@@ -15,7 +15,9 @@
 #   held down
 
 import logging
-from pynput.keyboard import Key, Listener
+import os
+import signal
+import sys
 
 
 # ######### #### ######## ##########
@@ -56,33 +58,58 @@ if SEND_LOGS_TO_FILE:
 # function.
 LOCKED_IN_GARBAGE_COLLECTION_LIMIT = 5
 
-MODIFIER_KEYS = [
-    Key.alt,
-    Key.alt_r,
-    Key.alt_l,
-    Key.cmd,
-    Key.cmd_r,
-    Key.cmd_l,
-    Key.ctrl,
-    Key.ctrl_r,
-    Key.ctrl_l,
-    Key.shift,
-    Key.shift_r,
-    Key.shift_l,
-]
+if sys.platform == 'linux':
+    # On Linux we use string-based key names from evdev instead of pynput
+    # Key objects. These mirror the pynput names for compatibility.
+    MODIFIER_KEYS = [
+        'alt', 'alt_r', 'alt_l',
+        'super', 'super_r', 'super_l',
+        'ctrl', 'ctrl_r', 'ctrl_l',
+        'shift', 'shift_r', 'shift_l',
+    ]
 
-IGNORED_KEYS = []
+    IGNORED_KEYS = []
 
-REMAP = {
-    Key.alt_r: Key.alt,
-    Key.alt_l: Key.alt,
-    Key.ctrl_r: Key.ctrl,
-    Key.ctrl_l: Key.ctrl,
-    Key.cmd_r: Key.cmd,
-    Key.cmd_l: Key.cmd,
-    Key.shift_r: Key.shift,
-    Key.shift_l: Key.shift,
-}
+    REMAP = {
+        'alt_r': 'alt',
+        'alt_l': 'alt',
+        'ctrl_r': 'ctrl',
+        'ctrl_l': 'ctrl',
+        'super_r': 'super',
+        'super_l': 'super',
+        'shift_r': 'shift',
+        'shift_l': 'shift',
+    }
+else:
+    from pynput.keyboard import Key, Listener
+
+    MODIFIER_KEYS = [
+        Key.alt,
+        Key.alt_r,
+        Key.alt_l,
+        Key.cmd,
+        Key.cmd_r,
+        Key.cmd_l,
+        Key.ctrl,
+        Key.ctrl_r,
+        Key.ctrl_l,
+        Key.shift,
+        Key.shift_r,
+        Key.shift_l,
+    ]
+
+    IGNORED_KEYS = []
+
+    REMAP = {
+        Key.alt_r: Key.alt,
+        Key.alt_l: Key.alt,
+        Key.ctrl_r: Key.ctrl,
+        Key.ctrl_l: Key.ctrl,
+        Key.cmd_r: Key.cmd,
+        Key.cmd_l: Key.cmd,
+        Key.shift_r: Key.shift,
+        Key.shift_l: Key.shift,
+    }
 
 keys_currently_down = []
 
@@ -261,12 +288,20 @@ def log(key):
   conceptually, to miss the mark on logging combos).
   """
   modifiers_down = [k for k in keys_currently_down if k in MODIFIER_KEYS]
-  if list(set([
-      Key.shift if k in [Key.shift, Key.shift_l, Key.shift_r] else k
-      for k in modifiers_down
-  ])) == [Key.shift] and key_is_a_symbol(key):
+  if sys.platform == 'linux':
+    shift_keys = ['shift', 'shift_l', 'shift_r']
+    shift_only = list(set([
+        'shift' if k in shift_keys else k
+        for k in modifiers_down
+    ])) == ['shift']
+  else:
+    shift_only = list(set([
+        Key.shift if k in [Key.shift, Key.shift_l, Key.shift_r] else k
+        for k in modifiers_down
+    ])) == [Key.shift]
+  if shift_only and key_is_a_symbol(key):
     modifiers_down = []
-  log_entry = datetime.utcnow().isoformat() + ': ' + ' + '.join(
+  log_entry = datetime.utcnow().isoformat() + ',' + ' + '.join(
       sorted([key_to_str(k) for k in modifiers_down])
       + [key_to_str(key)]
   )
@@ -293,6 +328,10 @@ def log(key):
 
 
 def key_is_a_symbol(key):
+  if sys.platform == 'linux':
+    # On Linux, keys are strings. Symbols are single characters;
+    # named keys like 'ctrl', 'alt', 'space' are multi-char strings.
+    return isinstance(key, str) and len(key) == 1
   return str(key)[0:4] != 'Key.'
 
 
@@ -309,6 +348,10 @@ def key_to_str(key):
   character (for example: "'a'") and it escapes backslashes, so that part
   undoes those two items.
   """
+  if sys.platform == 'linux':
+    if key_is_a_symbol(key):
+      return key
+    return f'<{key}>'
   s = str(key)
   if not key_is_a_symbol(key):
     s = f'<{s[4:]}>'
@@ -450,17 +493,205 @@ def preprocess(key, f):
 # ######### ######### ##########
 
 
+def _handle_sighup(signum, frame):
+  """Re-exec the process on SIGHUP so `systemctl --user reload` picks up code changes."""
+  logging.info('received SIGHUP, re-executing')
+  os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def main():
+  signal.signal(signal.SIGHUP, _handle_sighup)
   logging.info('getting set up')
   if SEND_LOGS_TO_SQLITE:
     setup_sqlite_database()
 
+  if sys.platform == 'linux':
+    main_linux()
+  else:
+    main_darwin()
+
+
+def main_darwin():
   with Listener(
       on_press=(lambda key: preprocess(key, key_down)),
       on_release=(lambda key: preprocess(key, key_up)),
   ) as listener:
     logging.info('starting to listen for keyboard events')
     listener.join()
+
+
+# ######### ############## ##########
+# ######### Linux / evdev  ##########
+# ######### ############## ##########
+
+# Mapping from evdev ecodes to key name strings used by the rest of this
+# script.  Symbols are single characters; named keys are short lowercase
+# names that get wrapped in angle brackets by key_to_str().
+
+EVDEV_KEY_MAP = None  # lazily built on first use
+
+
+def _build_evdev_key_map():
+  global EVDEV_KEY_MAP
+  from evdev import ecodes
+  m = {}
+
+  # Letters
+  for c in 'abcdefghijklmnopqrstuvwxyz':
+    m[getattr(ecodes, f'KEY_{c.upper()}')] = c
+
+  # Digits
+  for d in '1234567890':
+    m[getattr(ecodes, f'KEY_{d}')] = d
+
+  # Punctuation / symbols reachable without shift
+  simple = {
+      'MINUS': '-', 'EQUAL': '=', 'LEFTBRACE': '[', 'RIGHTBRACE': ']',
+      'SEMICOLON': ';', 'APOSTROPHE': "'", 'GRAVE': '`', 'BACKSLASH': '\\',
+      'COMMA': ',', 'DOT': '.', 'SLASH': '/', 'SPACE': ' ', 'TAB': '\t',
+  }
+  for ecode_name, char in simple.items():
+    code = getattr(ecodes, f'KEY_{ecode_name}', None)
+    if code is not None:
+      m[code] = char
+
+  # Named / special keys
+  named = {
+      'ENTER': 'enter', 'BACKSPACE': 'backspace', 'DELETE': 'delete',
+      'ESC': 'esc', 'INSERT': 'insert', 'HOME': 'home', 'END': 'end',
+      'PAGEUP': 'page_up', 'PAGEDOWN': 'page_down',
+      'UP': 'up', 'DOWN': 'down', 'LEFT': 'left', 'RIGHT': 'right',
+      'CAPSLOCK': 'caps_lock', 'NUMLOCK': 'num_lock',
+      'SCROLLLOCK': 'scroll_lock', 'PRINT': 'print_screen',
+      'PAUSE': 'pause', 'MENU': 'menu',
+  }
+  for ecode_name, name in named.items():
+    code = getattr(ecodes, f'KEY_{ecode_name}', None)
+    if code is not None:
+      m[code] = name
+
+  # Function keys F1-F20
+  for i in range(1, 21):
+    code = getattr(ecodes, f'KEY_F{i}', None)
+    if code is not None:
+      m[code] = f'f{i}'
+
+  # Modifiers
+  mod = {
+      'LEFTSHIFT': 'shift_l', 'RIGHTSHIFT': 'shift_r',
+      'LEFTCTRL': 'ctrl_l', 'RIGHTCTRL': 'ctrl_r',
+      'LEFTALT': 'alt_l', 'RIGHTALT': 'alt_r',
+      'LEFTMETA': 'super_l', 'RIGHTMETA': 'super_r',
+  }
+  for ecode_name, name in mod.items():
+    code = getattr(ecodes, f'KEY_{ecode_name}', None)
+    if code is not None:
+      m[code] = name
+
+  EVDEV_KEY_MAP = m
+
+
+# Shift mapping for producing shifted symbols from base characters
+SHIFT_SYMBOL_MAP = {
+    '1': '!', '2': '@', '3': '#', '4': '$', '5': '%',
+    '6': '^', '7': '&', '8': '*', '9': '(', '0': ')',
+    '-': '_', '=': '+', '[': '{', ']': '}', '\\': '|',
+    ';': ':', "'": '"', '`': '~', ',': '<', '.': '>',
+    '/': '?',
+}
+
+
+def _evdev_translate(code, shift_held):
+  """Translate an evdev key code to the string key name used by this script."""
+  if EVDEV_KEY_MAP is None:
+    _build_evdev_key_map()
+  name = EVDEV_KEY_MAP.get(code)
+  if name is None:
+    return None
+  # If shift is held and the base key is a letter, return uppercase
+  if shift_held and len(name) == 1 and name.isalpha():
+    return name.upper()
+  # If shift is held and there's a shifted symbol, return it
+  if shift_held and name in SHIFT_SYMBOL_MAP:
+    return SHIFT_SYMBOL_MAP[name]
+  return name
+
+
+def main_linux():
+  import selectors
+  import evdev
+  from evdev import categorize, ecodes
+
+  # Find all keyboard devices (those with EV_KEY capability)
+  devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+  keyboards = [
+      dev for dev in devices
+      if ecodes.EV_KEY in dev.capabilities()
+  ]
+
+  if not keyboards:
+    logging.error(
+        'No keyboard devices found. '
+        'Make sure your user is in the "input" group: '
+        'sudo usermod -aG input $USER  (then re-login)'
+    )
+    sys.exit(1)
+
+  for kb in keyboards:
+    logging.info(f'monitoring keyboard: {kb.path} ({kb.name})')
+
+  sel = selectors.DefaultSelector()
+  for kb in keyboards:
+    sel.register(kb, selectors.EVENT_READ)
+
+  logging.info('starting to listen for keyboard events')
+  try:
+    while True:
+      for selector_key, _ in sel.select():
+        device = selector_key.fileobj
+        for event in device.read():
+          if event.type != ecodes.EV_KEY:
+            continue
+          key_event = categorize(event)
+          # value: 1 = down, 0 = up, 2 = hold/repeat
+          if key_event.event.value == 2:
+            continue  # ignore key repeats
+
+          # Check if shift is currently held (for symbol translation)
+          shift_held = any(
+              k in ('shift', 'shift_l', 'shift_r')
+              for k in keys_currently_down
+          )
+          key_name = _evdev_translate(
+              key_event.scancode,
+              shift_held and key_event.event.value == 1,
+          )
+          if key_name is None:
+            continue
+
+          if key_event.event.value == 1:  # key down
+            preprocess(key_name, key_down)
+          elif key_event.event.value == 0:  # key up
+            # For key-up, always translate without shift so we can
+            # find the key in keys_currently_down
+            up_name = _evdev_translate(key_event.scancode, False)
+            # Try the un-shifted name first; if that's not in the
+            # down list, try with shift (the key may have been pressed
+            # while shift was held)
+            if up_name not in keys_currently_down:
+              shifted = _evdev_translate(key_event.scancode, True)
+              if shifted in keys_currently_down:
+                up_name = shifted
+              else:
+                # Check remapped names too
+                remapped = REMAP.get(up_name, up_name)
+                if remapped in keys_currently_down:
+                  up_name = remapped
+            preprocess(up_name, key_up)
+  except KeyboardInterrupt:
+    logging.info('stopping listener (keyboard interrupt)')
+  finally:
+    sel.close()
 
 
 if __name__ == '__main__':
