@@ -26,7 +26,7 @@ The code is **heavily** commented; perhaps excessively so. In fact, the code loo
 
 ### OS & Language
 
-I use this on my Mac, running on Python3 (3.8.1, but I presume any Python3 version would work), and haven't tried it on any other operating system. I presume it would work, but it seems easy to believe that there are details that I don't know of. If anyone tries it and finds ways to improve/extend it, that'd be great.
+Works on macOS (pynput) and Linux (evdev). On Linux/Wayland, pynput can't capture global keyboard events, so the script uses `python-evdev` to read directly from `/dev/input/event*` devices. Platform is auto-detected at startup.
 
 ### Output Storage
 
@@ -51,13 +51,53 @@ The Python logging module is used to provide INFO, DEBUG, WARNING, etc. messages
 
 ### Security Permissions
 
+#### macOS
+
 <img src="https://gleadee-public-us-east-1.s3.amazonaws.com/github/benign-key-logger/security_and_privacy.png" width="350" align="right" />
 
-I only know how (and even if you need) to grant keyboard access on a Mac. You must give the script Accessibility permissions in `System Preferences > Security & Privacy > Privacy > Accessibility`. (Don't forget that you likely need to unlock this Preferences screen to make any changes.) This gives the app you run it from permission to see the keyboard events. I usually use the Terminal, but you can also run it from your code editor. Without this step, the script will just sit there silently, deaf to all keyboard events. macOS automatically suppresses logging when it switches into Secure Input Mode (passwords). So, through no effort of my own, it very nicely avoids logging any information typed into OS-labeled password text boxes. At least for me, this is even true for password fields in my browser. Nice! (I don't know if Windows or Linux has anything comparable, so if you use it there, be aware that your passwords may or may not be tracked by the logger.)
+You must give the script Accessibility permissions in `System Preferences > Security & Privacy > Privacy > Accessibility`. (Don't forget that you likely need to unlock this Preferences screen to make any changes.) This gives the app you run it from permission to see the keyboard events. I usually use the Terminal, but you can also run it from your code editor. Without this step, the script will just sit there silently, deaf to all keyboard events. macOS automatically suppresses logging when it switches into Secure Input Mode (passwords). So, through no effort of my own, it very nicely avoids logging any information typed into OS-labeled password text boxes. At least for me, this is even true for password fields in my browser.
+
+#### Linux
+
+Your user must be in the `input` group to read `/dev/input/event*` devices:
+
+```bash
+sudo usermod -aG input $USER
+# Then re-login
+```
+
+The script auto-detects all keyboard devices (filtering by `EV_KEY` capability) and monitors them with `selectors`. It handles multiple keyboards (built-in + external) simultaneously.
+
+To run as a systemd user service with auto-restart and reload support:
+
+```bash
+# ~/.config/systemd/user/key-logger.service
+[Unit]
+Description=benign key logger (evdev)
+
+[Service]
+ExecStart=/usr/bin/python3 -u /path/to/key_logger.py
+WorkingDirectory=/path/to/benign-key-logger
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user enable --now key-logger
+# Reload after code changes (re-execs via SIGHUP):
+systemctl --user reload key-logger
+```
 
 ### Dependencies
 
-You'll need to install `pynput`. You can see more details on that library from [PyPi](https://pypi.org/project/pynput/) or [GitHub](https://github.com/moses-palmer/pynput), and you can read [its documentation](https://pynput.readthedocs.io/en/latest/) as well. The other items are all Python-standard libraries: `datetime`, `logging`, and `sqlite3`. I purposefully do not put `pynput` here in this repo because I don't want you to have to trust that the version included hasn't been tampered with. You can use `pip` to install it: `pip3 install pynput`.
+- **macOS**: `pip3 install pynput` — see [PyPi](https://pypi.org/project/pynput/) or [GitHub](https://github.com/moses-palmer/pynput)
+- **Linux**: `pip3 install evdev` — see [python-evdev docs](https://python-evdev.readthedocs.io/)
+
+Both are listed in `requirements.txt`. The other items are all Python-standard libraries: `datetime`, `logging`, and `sqlite3`.
 
 ### Running It
 
