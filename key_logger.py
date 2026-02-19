@@ -617,19 +617,46 @@ def _evdev_translate(code, shift_held):
   return name
 
 
+RESCAN_INTERVAL = 10  # seconds between device rescan checks
+
+
 def main_linux():
   import selectors
+  import time
   import evdev
   from evdev import categorize, ecodes
 
-  # Find all keyboard devices (those with EV_KEY capability)
-  devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-  keyboards = [
-      dev for dev in devices
-      if ecodes.EV_KEY in dev.capabilities()
-  ]
+  def scan_keyboards():
+    """Return a dict of {path: InputDevice} for all EV_KEY-capable devices."""
+    devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+    return {
+        dev.path: dev for dev in devices
+        if ecodes.EV_KEY in dev.capabilities()
+    }
 
-  if not keyboards:
+  sel = selectors.DefaultSelector()
+  monitored = {}  # path -> InputDevice
+
+  def rescan():
+    """Add new devices and remove stale ones."""
+    current = scan_keyboards()
+    # Remove devices that disappeared
+    for path in list(monitored):
+      if path not in current:
+        logging.info(f'device removed: {path} ({monitored[path].name})')
+        sel.unregister(monitored[path])
+        monitored[path].close()
+        del monitored[path]
+    # Add new devices
+    for path, dev in current.items():
+      if path not in monitored:
+        logging.info(f'monitoring keyboard: {path} ({dev.name})')
+        sel.register(dev, selectors.EVENT_READ)
+        monitored[path] = dev
+
+  rescan()
+
+  if not monitored:
     logging.error(
         'No keyboard devices found. '
         'Make sure your user is in the "input" group: '
@@ -637,19 +664,30 @@ def main_linux():
     )
     sys.exit(1)
 
-  for kb in keyboards:
-    logging.info(f'monitoring keyboard: {kb.path} ({kb.name})')
-
-  sel = selectors.DefaultSelector()
-  for kb in keyboards:
-    sel.register(kb, selectors.EVENT_READ)
-
   logging.info('starting to listen for keyboard events')
+  last_rescan = time.monotonic()
   try:
     while True:
-      for selector_key, _ in sel.select():
+      # Rescan for new/removed devices periodically
+      now = time.monotonic()
+      if now - last_rescan >= RESCAN_INTERVAL:
+        rescan()
+        last_rescan = now
+
+      ready = sel.select(timeout=RESCAN_INTERVAL)
+      for selector_key, _ in ready:
         device = selector_key.fileobj
-        for event in device.read():
+        try:
+          events = device.read()
+        except OSError:
+          # Device was disconnected
+          path = device.path
+          logging.info(f'device disconnected: {path} ({device.name})')
+          sel.unregister(device)
+          device.close()
+          monitored.pop(path, None)
+          continue
+        for event in events:
           if event.type != ecodes.EV_KEY:
             continue
           key_event = categorize(event)
