@@ -524,39 +524,40 @@ def main_darwin():
 # ######### Linux / evdev  ##########
 # ######### ############## ##########
 
-# Mapping from evdev ecodes to key name strings used by the rest of this
-# script.  Symbols are single characters; named keys are short lowercase
-# names that get wrapped in angle brackets by key_to_str().
+# Evdev keycodes are translated to characters using libxkbcommon, which
+# respects the active keyboard layout (e.g. Russian).  Modifier and named
+# keys (Enter, arrows, …) use a static map.  If XKB initialisation fails
+# the logger falls back to a hardcoded US-QWERTY character map.
 
-EVDEV_KEY_MAP = None  # lazily built on first use
+import ctypes
+import ctypes.util
+import re
+import subprocess
+import threading
+
+# -- Static maps for modifiers and named keys (layout-independent) --------
+
+EVDEV_MODIFIER_MAP = None   # lazily built
+EVDEV_NAMED_KEY_MAP = None  # lazily built
 
 
-def _build_evdev_key_map():
-  global EVDEV_KEY_MAP
+def _build_evdev_maps():
+  global EVDEV_MODIFIER_MAP, EVDEV_NAMED_KEY_MAP
   from evdev import ecodes
-  m = {}
 
-  # Letters
-  for c in 'abcdefghijklmnopqrstuvwxyz':
-    m[getattr(ecodes, f'KEY_{c.upper()}')] = c
-
-  # Digits
-  for d in '1234567890':
-    m[getattr(ecodes, f'KEY_{d}')] = d
-
-  # Punctuation / symbols reachable without shift
-  simple = {
-      'MINUS': '-', 'EQUAL': '=', 'LEFTBRACE': '[', 'RIGHTBRACE': ']',
-      'SEMICOLON': ';', 'APOSTROPHE': "'", 'GRAVE': '`', 'BACKSLASH': '\\',
-      'COMMA': ',', 'DOT': '.', 'SLASH': '/', 'SPACE': ' ', 'TAB': '\t',
-  }
-  for ecode_name, char in simple.items():
+  EVDEV_MODIFIER_MAP = {}
+  for ecode_name, name in {
+      'LEFTSHIFT': 'shift_l', 'RIGHTSHIFT': 'shift_r',
+      'LEFTCTRL': 'ctrl_l', 'RIGHTCTRL': 'ctrl_r',
+      'LEFTALT': 'alt_l', 'RIGHTALT': 'alt_r',
+      'LEFTMETA': 'super_l', 'RIGHTMETA': 'super_r',
+  }.items():
     code = getattr(ecodes, f'KEY_{ecode_name}', None)
     if code is not None:
-      m[code] = char
+      EVDEV_MODIFIER_MAP[code] = name
 
-  # Named / special keys
-  named = {
+  EVDEV_NAMED_KEY_MAP = {}
+  for ecode_name, name in {
       'ENTER': 'enter', 'BACKSPACE': 'backspace', 'DELETE': 'delete',
       'ESC': 'esc', 'INSERT': 'insert', 'HOME': 'home', 'END': 'end',
       'PAGEUP': 'page_up', 'PAGEDOWN': 'page_down',
@@ -564,34 +565,207 @@ def _build_evdev_key_map():
       'CAPSLOCK': 'caps_lock', 'NUMLOCK': 'num_lock',
       'SCROLLLOCK': 'scroll_lock', 'PRINT': 'print_screen',
       'PAUSE': 'pause', 'MENU': 'menu',
-  }
-  for ecode_name, name in named.items():
+  }.items():
     code = getattr(ecodes, f'KEY_{ecode_name}', None)
     if code is not None:
-      m[code] = name
-
-  # Function keys F1-F20
+      EVDEV_NAMED_KEY_MAP[code] = name
   for i in range(1, 21):
     code = getattr(ecodes, f'KEY_F{i}', None)
     if code is not None:
-      m[code] = f'f{i}'
+      EVDEV_NAMED_KEY_MAP[code] = f'f{i}'
 
-  # Modifiers
-  mod = {
-      'LEFTSHIFT': 'shift_l', 'RIGHTSHIFT': 'shift_r',
-      'LEFTCTRL': 'ctrl_l', 'RIGHTCTRL': 'ctrl_r',
-      'LEFTALT': 'alt_l', 'RIGHTALT': 'alt_r',
-      'LEFTMETA': 'super_l', 'RIGHTMETA': 'super_r',
-  }
-  for ecode_name, name in mod.items():
+
+# -- XKB layout-aware translation ----------------------------------------
+
+class _XkbRuleNames(ctypes.Structure):
+  _fields_ = [
+      ('rules', ctypes.c_char_p),
+      ('model', ctypes.c_char_p),
+      ('layout', ctypes.c_char_p),
+      ('variant', ctypes.c_char_p),
+      ('options', ctypes.c_char_p),
+  ]
+
+_xkb_lib = None
+_xkb_state = None
+_xkb_keymap = None
+_current_group = 0
+_layout_to_group = {}  # layout name -> XKB group index
+_XKB_MOD_SHIFT_MASK = 1  # Shift is modifier index 0
+
+
+def _init_xkb():
+  """Initialise libxkbcommon with the system keyboard layouts."""
+  global _xkb_lib, _xkb_state, _xkb_keymap
+
+  lib_path = ctypes.util.find_library('xkbcommon')
+  if not lib_path:
+    logging.warning('libxkbcommon not found, falling back to QWERTY map')
+    return False
+  _xkb_lib = ctypes.CDLL(lib_path)
+
+  _xkb_lib.xkb_context_new.restype = ctypes.c_void_p
+  _xkb_lib.xkb_keymap_new_from_names.restype = ctypes.c_void_p
+  _xkb_lib.xkb_keymap_new_from_names.argtypes = [
+      ctypes.c_void_p, ctypes.POINTER(_XkbRuleNames), ctypes.c_int]
+  _xkb_lib.xkb_state_new.restype = ctypes.c_void_p
+  _xkb_lib.xkb_state_new.argtypes = [ctypes.c_void_p]
+  _xkb_lib.xkb_state_key_get_utf8.restype = ctypes.c_int
+  _xkb_lib.xkb_state_key_get_utf8.argtypes = [
+      ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t]
+  _xkb_lib.xkb_state_update_mask.restype = ctypes.c_int
+  _xkb_lib.xkb_state_update_mask.argtypes = (
+      [ctypes.c_void_p] + [ctypes.c_uint32] * 6)
+
+  # Read layout configuration from GNOME
+  try:
+    sources = subprocess.check_output(
+        ['gsettings', 'get', 'org.gnome.desktop.input-sources', 'sources'],
+        text=True).strip()
+    options_str = subprocess.check_output(
+        ['gsettings', 'get', 'org.gnome.desktop.input-sources', 'xkb-options'],
+        text=True).strip()
+  except Exception:
+    sources = "[('xkb', 'us')]"
+    options_str = "[]"
+
+  layouts, variants = [], []
+  for m in re.finditer(r"\('xkb',\s*'([^']+)'\)", sources):
+    s = m.group(1)
+    if '+' in s:
+      l, v = s.split('+', 1)
+      layouts.append(l); variants.append(v)
+    else:
+      layouts.append(s); variants.append('')
+  options = [m.group(1) for m in re.finditer(r"'([^']+)'", options_str)]
+
+  ctx = _xkb_lib.xkb_context_new(0)
+  names = _XkbRuleNames()
+  names.rules = b'evdev'
+  names.model = b'pc105'
+  names.layout = ','.join(layouts).encode()
+  names.variant = ','.join(variants).encode()
+  names.options = ','.join(options).encode()
+
+  _xkb_keymap = _xkb_lib.xkb_keymap_new_from_names(
+      ctx, ctypes.byref(names), 0)
+  if not _xkb_keymap:
+    logging.warning('XKB keymap creation failed, falling back to QWERTY map')
+    return False
+
+  _xkb_state = _xkb_lib.xkb_state_new(_xkb_keymap)
+
+  global _layout_to_group
+  # Build name → group index map. Use the raw source name (e.g. 'isrt-rus')
+  # which is what GNOME reports in mru-sources.
+  source_names = [m.group(1) for m in
+                  re.finditer(r"\('xkb',\s*'([^']+)'\)", sources)]
+  _layout_to_group = {name: idx for idx, name in enumerate(source_names)}
+
+  logging.info(f'XKB initialised: layouts={",".join(layouts)}')
+  return True
+
+
+def _start_layout_monitor():
+  """Watch GNOME's active input source via D-Bus mru-sources signal."""
+  global _current_group
+  try:
+    from gi.repository import Gio, GLib
+
+    def on_dconf_changed(conn, sender, path, iface, signal, params):
+      global _current_group
+      # params is (path, keys, tag) from DConf.Writer.Notify
+      # or (schema, key, value) from GSettings PropertiesChanged
+      try:
+        args = params.unpack()
+        # DConf signal: args[0] is the path like '/org/gnome/desktop/input-sources/mru-sources'
+        # We only care about mru-sources changes
+        path_str = str(args[0]) if args else ''
+        if 'mru-sources' not in path_str:
+          return
+      except Exception:
+        pass
+      # Read the current mru-sources value
+      try:
+        settings = Gio.Settings.new('org.gnome.desktop.input-sources')
+        mru = settings.get_value('mru-sources')
+        if mru.n_children() > 0:
+          first = mru.get_child_value(0)
+          active_layout = first.get_child_value(1).get_string()
+          new_group = _layout_to_group.get(active_layout, 0)
+          if new_group != _current_group:
+            _current_group = new_group
+            logging.info(f'keyboard layout changed to {active_layout} (group {new_group})')
+      except Exception as e:
+        logging.debug(f'mru-sources read failed: {e}')
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    bus.signal_subscribe(
+        None,              # sender (any)
+        'ca.desrt.dconf.Writer',  # DConf Writer interface
+        'Notify',          # signal name
+        None,              # path (any)
+        None,              # arg0 (any)
+        Gio.DBusSignalFlags.NONE,
+        on_dconf_changed,
+    )
+
+    # Read initial value
+    settings = Gio.Settings.new('org.gnome.desktop.input-sources')
+    mru = settings.get_value('mru-sources')
+    if mru.n_children() > 0:
+      first = mru.get_child_value(0)
+      active_layout = first.get_child_value(1).get_string()
+      _current_group = _layout_to_group.get(active_layout, 0)
+
+    loop = GLib.MainLoop()
+    threading.Thread(target=loop.run, daemon=True).start()
+    logging.info(f'layout monitor started (current group: {_current_group})')
+  except Exception as e:
+    logging.warning(f'layout monitor unavailable: {e}')
+
+
+def _xkb_translate(evdev_code, shift_held):
+  """Translate an evdev keycode to a character using XKB + active layout."""
+  if _xkb_state is None:
+    return None
+  mods = _XKB_MOD_SHIFT_MASK if shift_held else 0
+  _xkb_lib.xkb_state_update_mask(
+      _xkb_state, mods, 0, 0, 0, 0, _current_group)
+  buf = ctypes.create_string_buffer(8)
+  size = _xkb_lib.xkb_state_key_get_utf8(
+      _xkb_state, evdev_code + 8, buf, 8)
+  if size > 0:
+    char = buf.value.decode('utf-8')
+    if len(char) == 1 and (char.isprintable() or char in (' ', '\t')):
+      return char
+  return None
+
+
+# -- Hardcoded QWERTY fallback (used when XKB is unavailable) -------------
+
+EVDEV_QWERTY_MAP = None
+
+
+def _build_qwerty_fallback():
+  global EVDEV_QWERTY_MAP
+  from evdev import ecodes
+  m = {}
+  for c in 'abcdefghijklmnopqrstuvwxyz':
+    m[getattr(ecodes, f'KEY_{c.upper()}')] = c
+  for d in '1234567890':
+    m[getattr(ecodes, f'KEY_{d}')] = d
+  for ecode_name, char in {
+      'MINUS': '-', 'EQUAL': '=', 'LEFTBRACE': '[', 'RIGHTBRACE': ']',
+      'SEMICOLON': ';', 'APOSTROPHE': "'", 'GRAVE': '`', 'BACKSLASH': '\\',
+      'COMMA': ',', 'DOT': '.', 'SLASH': '/', 'SPACE': ' ', 'TAB': '\t',
+  }.items():
     code = getattr(ecodes, f'KEY_{ecode_name}', None)
     if code is not None:
-      m[code] = name
+      m[code] = char
+  EVDEV_QWERTY_MAP = m
 
-  EVDEV_KEY_MAP = m
 
-
-# Shift mapping for producing shifted symbols from base characters
 SHIFT_SYMBOL_MAP = {
     '1': '!', '2': '@', '3': '#', '4': '$', '5': '%',
     '6': '^', '7': '&', '8': '*', '9': '(', '0': ')',
@@ -601,17 +775,34 @@ SHIFT_SYMBOL_MAP = {
 }
 
 
+# -- Main translation entry point ----------------------------------------
+
 def _evdev_translate(code, shift_held):
   """Translate an evdev key code to the string key name used by this script."""
-  if EVDEV_KEY_MAP is None:
-    _build_evdev_key_map()
-  name = EVDEV_KEY_MAP.get(code)
+  if EVDEV_MODIFIER_MAP is None:
+    _build_evdev_maps()
+
+  # Modifiers — always return named string
+  if code in EVDEV_MODIFIER_MAP:
+    return EVDEV_MODIFIER_MAP[code]
+
+  # Named keys (enter, backspace, arrows, Fn, …)
+  if code in EVDEV_NAMED_KEY_MAP:
+    return EVDEV_NAMED_KEY_MAP[code]
+
+  # Character keys — try XKB first (layout-aware)
+  char = _xkb_translate(code, shift_held)
+  if char is not None:
+    return char
+
+  # Fallback to hardcoded QWERTY map
+  if EVDEV_QWERTY_MAP is None:
+    _build_qwerty_fallback()
+  name = EVDEV_QWERTY_MAP.get(code)
   if name is None:
     return None
-  # If shift is held and the base key is a letter, return uppercase
   if shift_held and len(name) == 1 and name.isalpha():
     return name.upper()
-  # If shift is held and there's a shifted symbol, return it
   if shift_held and name in SHIFT_SYMBOL_MAP:
     return SHIFT_SYMBOL_MAP[name]
   return name
@@ -625,6 +816,10 @@ def main_linux():
   import time
   import evdev
   from evdev import categorize, ecodes
+
+  # Initialise XKB for layout-aware key translation
+  if _init_xkb():
+    _start_layout_monitor()
 
   def scan_keyboards():
     """Return a dict of {path: InputDevice} for all EV_KEY-capable devices."""
@@ -666,6 +861,10 @@ def main_linux():
 
   logging.info('starting to listen for keyboard events')
   last_rescan = time.monotonic()
+  # Track scancode → key name for reliable key-up matching across layout
+  # switches (e.g. key pressed in Russian, released after switching to
+  # English)
+  down_scancodes = {}  # scancode -> key_name stored on key-down
   try:
     while True:
       # Rescan for new/removed devices periodically
@@ -700,31 +899,31 @@ def main_linux():
               k in ('shift', 'shift_l', 'shift_r')
               for k in keys_currently_down
           )
-          key_name = _evdev_translate(
-              key_event.scancode,
-              shift_held and key_event.event.value == 1,
-          )
-          if key_name is None:
-            continue
 
           if key_event.event.value == 1:  # key down
+            key_name = _evdev_translate(
+                key_event.scancode,
+                shift_held,
+            )
+            if key_name is None:
+              continue
+            down_scancodes[key_event.scancode] = key_name
             preprocess(key_name, key_down)
+
           elif key_event.event.value == 0:  # key up
-            # For key-up, always translate without shift so we can
-            # find the key in keys_currently_down
-            up_name = _evdev_translate(key_event.scancode, False)
-            # Try the un-shifted name first; if that's not in the
-            # down list, try with shift (the key may have been pressed
-            # while shift was held)
+            # Use the stored name from key-down so layout switches
+            # between press and release don't cause mismatches
+            up_name = down_scancodes.pop(key_event.scancode, None)
+            if up_name is None:
+              up_name = _evdev_translate(key_event.scancode, False)
+            if up_name is None:
+              continue
+            # If the stored name isn't in keys_currently_down (e.g.
+            # because it was remapped), try the remapped version
             if up_name not in keys_currently_down:
-              shifted = _evdev_translate(key_event.scancode, True)
-              if shifted in keys_currently_down:
-                up_name = shifted
-              else:
-                # Check remapped names too
-                remapped = REMAP.get(up_name, up_name)
-                if remapped in keys_currently_down:
-                  up_name = remapped
+              remapped = REMAP.get(up_name, up_name)
+              if remapped in keys_currently_down:
+                up_name = remapped
             preprocess(up_name, key_up)
   except KeyboardInterrupt:
     logging.info('stopping listener (keyboard interrupt)')
